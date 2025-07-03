@@ -2,10 +2,12 @@ package cat
 
 import (
 	"context"
-	"crypto/rand"
+	crand "crypto/rand"
 	"fmt"
 	"maps"
 	"math/big"
+	mrand "math/rand"
+	"slices"
 	"sync"
 
 	"github.com/ppopth/p2p-broadcast/pb"
@@ -17,11 +19,18 @@ import (
 
 var log = logging.Logger("cat")
 
+type MsgIdFunc func([]byte) string
+
 type CatOption func(*CatRouter) error
 
 // NewCat returns a new CatRouter object.
-func NewCat(opts ...CatOption) (*CatRouter, error) {
-	c := &CatRouter{}
+func NewCat(idFunc MsgIdFunc, opts ...CatOption) (*CatRouter, error) {
+	c := &CatRouter{
+		idFunc: idFunc,
+
+		peers:  make(map[peer.ID]pubsub.TopicSendFunc),
+		chunks: make(map[string][]Chunk),
+	}
 
 	err := WithCatParams(DefaultCatParams())(c)
 	if err != nil {
@@ -45,8 +54,9 @@ func DefaultCatParams() CatParams {
 
 	params := CatParams{
 		ChunkSize:      1024, // 1KB
-		MaxCoefficient: *big.NewInt(255),
-		Prime:          *p, // 2^256+297 (the first prime having more than 256 bits)
+		MaxCoefficient: big.NewInt(255),
+		Prime:          p, // 2^256+297 (the first prime having more than 256 bits)
+		Fanout:         40,
 	}
 	params.ElementsPerChunk = 8 * params.ChunkSize / (p.BitLen() - 1)
 
@@ -69,12 +79,20 @@ func WithCatParams(params CatParams) CatOption {
 	}
 }
 
+type Chunk struct {
+	Data   []byte
+	Coeffs []*big.Int
+}
+
 // CatRouter is a router that implements the CAT protocol.
 type CatRouter struct {
 	lk sync.Mutex
 
 	params CatParams
+	idFunc MsgIdFunc
+
 	peers  map[peer.ID]pubsub.TopicSendFunc
+	chunks map[string][]Chunk
 }
 
 type CatParams struct {
@@ -84,9 +102,11 @@ type CatParams struct {
 	// The number of field elements per chunk.
 	ElementsPerChunk int
 	// Max coeficient used in linear combinations.
-	MaxCoefficient big.Int
+	MaxCoefficient *big.Int
 	// Prime number of the prime field used in linear combinations.
-	Prime big.Int
+	Prime *big.Int
+	// The number of chunks sent out in total, when publish.
+	Fanout int
 }
 
 func (c *CatRouter) Publish(buf []byte) error {
@@ -94,6 +114,8 @@ func (c *CatRouter) Publish(buf []byte) error {
 		return fmt.Errorf("the size of the message (%d) must be a multiple of the chunk size (%d)",
 			len(buf), c.params.ChunkSize)
 	}
+
+	mid := c.idFunc(buf)
 
 	// Divide into chunks
 	var chunks [][]byte
@@ -104,37 +126,50 @@ func (c *CatRouter) Publish(buf []byte) error {
 	}
 
 	c.lk.Lock()
-	peers := maps.Clone(c.peers)
+	sendFuncs := slices.Collect(maps.Values(c.peers))
+	// Shuffle the peers
+	mrand.Shuffle(len(sendFuncs), func(i, j int) {
+		sendFuncs[i], sendFuncs[j] = sendFuncs[j], sendFuncs[i]
+	})
 	c.lk.Unlock()
 
-	for pid, sendFunc := range peers {
+	sendFuncIndex := 0
+	// Do a round robin on peers to send the chunks
+	for i := 0; i < c.params.Fanout; i++ {
 		// do linear combination for each peer
-		chunked, coeffs, err := c.combine(chunks)
+		combined, err := c.combine(chunks)
 		if err != nil {
-			log.Warnf("error publishing to %s; %s", pid, err)
+			log.Warnf("error publishing; %s", err)
 			// Skipping to the next peer
 			continue
 		}
 		// send the combined chunk to that peer
 		chunk := &pb.CatRpc_Chunk{
-			Data: chunked,
+			MessageID: &mid,
+			Data:      combined.Data,
 		}
-		for _, coeff := range coeffs {
+		for _, coeff := range combined.Coeffs {
 			chunk.Coefficients = append(chunk.Coefficients, coeff.Bytes())
 		}
-		sendFunc(&pb.TopicRpc{
+		sendFuncs[sendFuncIndex](&pb.TopicRpc{
 			Cat: &pb.CatRpc{
 				Chunks: []*pb.CatRpc_Chunk{chunk},
 			},
 		})
+
+		sendFuncIndex++
+		sendFuncIndex %= len(sendFuncs)
 	}
 	return nil
 }
 
 // combine does linear combination on chunks and return the combined chunk and its coefficients.
-func (c *CatRouter) combine(chunks [][]byte) ([]byte, []*big.Int, error) {
+func (c *CatRouter) combine(chunks [][]byte) (Chunk, error) {
 	var coeffs []*big.Int
 	acc := make([]*big.Int, c.params.ElementsPerChunk)
+	for i := range acc {
+		acc[i] = new(big.Int)
+	}
 	bitsPerElement := 8 * c.params.ChunkSize / c.params.ElementsPerChunk
 
 	for _, chunk := range chunks {
@@ -148,13 +183,13 @@ func (c *CatRouter) combine(chunks [][]byte) ([]byte, []*big.Int, error) {
 			panic("splitBitsToBigInts returned a wrong vector")
 		}
 		// Randomize a coefficient
-		coeff, err := rand.Int(rand.Reader, &c.params.MaxCoefficient)
+		coeff, err := crand.Int(crand.Reader, c.params.MaxCoefficient)
 		if err != nil {
-			return nil, nil, err
+			return Chunk{}, err
 		}
 		coeffs = append(coeffs, coeff)
 		for i, elem := range v {
-			acc[i].Add(acc[i], new(big.Int).Mul(coeff, elem)) // acc[i] += coeff * elem
+			acc[i].Mod(new(big.Int).Add(acc[i], new(big.Int).Mul(coeff, elem)), c.params.Prime) // acc[i] = (acc[i] + coeff * elem) % Prime
 		}
 	}
 
@@ -163,7 +198,11 @@ func (c *CatRouter) combine(chunks [][]byte) ([]byte, []*big.Int, error) {
 		// There is supposed to be no errors
 		panic(err)
 	}
-	return combined, coeffs, nil
+	chunk := Chunk{
+		Data:   combined,
+		Coeffs: coeffs,
+	}
+	return chunk, nil
 }
 
 func (c *CatRouter) Next(ctx context.Context) ([]byte, error) {
@@ -185,6 +224,25 @@ func (c *CatRouter) RemovePeer(p peer.ID) {
 }
 
 func (c *CatRouter) HandleIncomingRPC(p peer.ID, trpc *pb.TopicRpc) {
+	c.lk.Lock()
+	defer c.lk.Unlock()
+
+	catRpc := trpc.GetCat()
+	// Remember chunks
+	for _, chunk := range catRpc.GetChunks() {
+		mid := chunk.GetMessageID()
+		data := chunk.GetData()
+		var coeffs []*big.Int
+		for _, buf := range chunk.GetCoefficients() {
+			coeffs = append(coeffs, new(big.Int).SetBytes(buf))
+		}
+		if data != nil {
+			c.chunks[mid] = append(c.chunks[mid], Chunk{
+				Data:   data,
+				Coeffs: coeffs,
+			})
+		}
+	}
 }
 
 func (c *CatRouter) Close() error {
@@ -256,4 +314,79 @@ func bigIntsToBytes(chunks []*big.Int, k int) ([]byte, error) {
 	}
 
 	return result, nil
+}
+
+// invertMatrix computes the inverse of an n x n matrix over F_p using Gaussian elimination. (credit to ChatGPT)
+func invertMatrix(A [][]*big.Int, p *big.Int) ([][]*big.Int, error) {
+	n := len(A)
+	inv := make([][]*big.Int, n)
+	for i := range inv {
+		inv[i] = make([]*big.Int, n)
+		for j := range inv[i] {
+			if i == j {
+				inv[i][j] = big.NewInt(1)
+			} else {
+				inv[i][j] = big.NewInt(0)
+			}
+		}
+	}
+
+	// Make a deep copy of A to work on
+	B := make([][]*big.Int, n)
+	for i := range A {
+		B[i] = make([]*big.Int, n)
+		for j := range A[i] {
+			B[i][j] = new(big.Int).Set(A[i][j])
+		}
+	}
+
+	for i := 0; i < n; i++ {
+		// Find pivot
+		invPivot := new(big.Int).ModInverse(B[i][i], p)
+		if invPivot == nil {
+			return nil, fmt.Errorf("matrix not invertible")
+		}
+		for j := 0; j < n; j++ {
+			B[i][j].Mul(B[i][j], invPivot).Mod(B[i][j], p)
+			inv[i][j].Mul(inv[i][j], invPivot).Mod(inv[i][j], p)
+		}
+		// Eliminate other rows
+		for k := 0; k < n; k++ {
+			if k == i {
+				continue
+			}
+			factor := new(big.Int).Set(B[k][i])
+			for j := 0; j < n; j++ {
+				tmp := new(big.Int).Mul(factor, B[i][j])
+				B[k][j].Sub(B[k][j], tmp).Mod(B[k][j], p)
+
+				tmp2 := new(big.Int).Mul(factor, inv[i][j])
+				inv[k][j].Sub(inv[k][j], tmp2).Mod(inv[k][j], p)
+			}
+		}
+	}
+	return inv, nil
+}
+
+// recoverVectors solves V = A⁻¹ * R, where A is the coefficient matrix and R the combined vectors. (credit to ChatGPT)
+func recoverVectors(A [][]*big.Int, R [][]*big.Int, p *big.Int) ([][]*big.Int, error) {
+	n := len(A)
+	m := len(R[0])
+	Ainv, err := invertMatrix(A, p)
+	if err != nil {
+		return nil, err
+	}
+
+	V := make([][]*big.Int, n)
+	for i := range V {
+		V[i] = make([]*big.Int, m)
+		for j := 0; j < m; j++ {
+			V[i][j] = big.NewInt(0)
+			for k := 0; k < n; k++ {
+				tmp := new(big.Int).Mul(Ainv[i][k], R[k][j])
+				V[i][j].Add(V[i][j], tmp).Mod(V[i][j], p)
+			}
+		}
+	}
+	return V, nil
 }
